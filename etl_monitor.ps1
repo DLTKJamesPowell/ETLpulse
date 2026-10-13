@@ -266,38 +266,62 @@ FROM $etlLog
 WHERE ID_BATCH >= (SELECT MAX(ID_BATCH) - 300 FROM $etlLog)
 ORDER BY ID_BATCH DESC;
 "@
-    $rawLog = Invoke-OracleQuery $logSql
-    Write-Host "--- RAW ETL_LOG OUTPUT ---"
-    $rawLog | Select-Object -First 10 | ForEach-Object { Write-Host $_ }
-    Write-Host "--- END RAW OUTPUT ---"
-    $logRows = @(ConvertFrom-SqlPlusCsv $rawLog)
-    Write-Host "ETL_LOG rows returned: $($logRows.Count)"
+    $logRows = @(ConvertFrom-SqlPlusCsv (Invoke-OracleQuery $logSql))
 
-    # 2. v$session_longops — any currently active long-running operation
+    # 2. v$session_longops — active ops joined on sid+serial# for accuracy
     $longopsSql = @"
 SELECT sl.sql_id, sl.sid, sl.opname, sl.target,
        sl.sofar, sl.totalwork,
        ROUND(sl.sofar / NULLIF(sl.totalwork, 0) * 100, 2) AS pct_complete,
        sl.elapsed_seconds,
        sl.time_remaining,
+       sl.message,
        TO_CHAR(SYSDATE + NUMTODSINTERVAL(sl.time_remaining, 'SECOND'),
                'DD-MON-YYYY HH24:MI:SS') AS estimated_finish
 FROM v`$session_longops sl
+JOIN v`$session s ON s.sid = sl.sid AND s.serial# = sl.serial#
 WHERE sl.totalwork > 0
-  AND sl.sofar < sl.totalwork
   AND sl.elapsed_seconds > 60
+  AND s.status = 'ACTIVE'
+  AND s.username IS NOT NULL
 ORDER BY sl.elapsed_seconds DESC;
 "@
-    $rawLongops = Invoke-OracleQuery $longopsSql
-    Write-Host "--- RAW LONGOPS OUTPUT ---"
-    $rawLongops | ForEach-Object { Write-Host $_ }
-    Write-Host "--- END LONGOPS OUTPUT ---"
-    $longops = @(ConvertFrom-SqlPlusCsv $rawLongops)
-    Write-Host "Longops rows parsed: $($longops.Count)"
+    $longops = @(ConvertFrom-SqlPlusCsv (Invoke-OracleQuery $longopsSql))
 
+    # 2b. Plan monitor — per-operation row counts for the top active sql_id
+    $planMonitor = @()
+    if ($longops.Count -gt 0 -and $longops[0].sql_id) {
+        $topSqlId = $longops[0].sql_id
+        $planMonSql = @"
+SELECT m.sql_plan_line_id AS line_id,
+       m.operation,
+       m.options,
+       m.object_name,
+       p.cardinality AS estimated_rows,
+       m.starts,
+       m.output_rows,
+       ROUND(m.output_rows / NULLIF(p.cardinality, 0), 1) AS ratio,
+       ROUND(m.physical_read_bytes / 1024 / 1024 / 1024, 2) AS read_gb
+FROM v`$sql_plan_monitor m
+LEFT JOIN v`$sql_plan p
+  ON p.sql_id = m.sql_id
+ AND p.plan_hash_value = m.sql_plan_hash_value
+ AND p.id = m.sql_plan_line_id
+WHERE m.sql_id = '$topSqlId'
+  AND m.status = 'EXECUTING'
+ORDER BY m.sql_plan_line_id;
+"@
+        $planMonitor = @(ConvertFrom-SqlPlusCsv (Invoke-OracleQuery $planMonSql))
+    }
 
     # 3. Index presence, validity and visibility check
     $idxSql = @"
+COLUMN expected_name      FORMAT A32
+COLUMN table_name         FORMAT A32
+COLUMN actual_index_name  FORMAT A32
+COLUMN idx_status         FORMAT A10
+COLUMN visibility         FORMAT A10
+COLUMN status             FORMAT A12
 WITH expected AS (
   SELECT 'IDX_DBA1_C_D_AUDIT' AS expected_name, 'C_D_AUDIT' AS table_name, 'LOAD_END_TIME,LOAD_START_TIME' AS cols FROM dual UNION ALL
   SELECT 'IDX_DBA2_EXCUST', 'EXCUSTOMERRECONCILIATIONJOURNA', 'ORIGINALRECONCILIATIONNUMBER,POSTEDPN' FROM dual UNION ALL
@@ -317,11 +341,11 @@ actual AS (
     AND  ic.index_owner = '$($Config.EtlSchema)'
   GROUP  BY ic.index_owner, ic.table_name, ic.index_name
 )
-SELECT e.expected_name,
-       e.table_name,
-       a.index_name AS actual_index_name,
-       ai.status    AS idx_status,
-       ai.visibility,
+SELECT SUBSTR(e.expected_name,1,40) AS expected_name,
+       SUBSTR(e.table_name,1,35)    AS table_name,
+       SUBSTR(a.index_name,1,40)    AS actual_index_name,
+       SUBSTR(ai.status,1,10)       AS idx_status,
+       SUBSTR(ai.visibility,1,10)   AS visibility,
        CASE
          WHEN a.index_name IS NULL           THEN 'MISSING'
          WHEN ai.status <> 'VALID'           THEN 'INVALID'
@@ -338,7 +362,7 @@ ORDER  BY e.expected_name;
 "@
     $indexCheck = @(ConvertFrom-SqlPlusCsv (Invoke-OracleQuery $idxSql))
 
-    return @{ Log = $logRows; LongOps = $longops; IndexCheck = $indexCheck }
+    return @{ Log = $logRows; LongOps = $longops; PlanMonitor = $planMonitor; IndexCheck = $indexCheck }
 }
 
 # ---------------------------------------------------------------------------
@@ -347,17 +371,18 @@ ORDER  BY e.expected_name;
 function Build-Html {
     param($Data)
 
-    $now        = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $logRows    = $Data.Log
-    $longops    = $Data.LongOps
-    $indexCheck = @($Data.IndexCheck)
+    $now         = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logRows     = $Data.Log
+    $longops     = $Data.LongOps
+    $planMonitor = @($Data.PlanMonitor)
+    $indexCheck  = @($Data.IndexCheck)
 
     $idxAllOk  = ($indexCheck.Count -gt 0) -and ($indexCheck | Where-Object { $_.STATUS -notmatch '^OK' }).Count -eq 0
     $idxBadgeCls  = if ($idxAllOk) { 'idx-badge-ok' } else { 'idx-badge-warn' }
     $idxBadgeTxt  = if ($idxAllOk) { 'Indexes OK' } else { 'Index Issue' }
     $idxRows = ($indexCheck | ForEach-Object {
         $rowCls = if ($_.STATUS -match '^OK') { '' } else { ' class="idx-missing"' }
-        "<tr$rowCls><td>$($_.expected_name)</td><td>$($_.table_name)</td><td>$($_.STATUS)</td></tr>"
+        "<tr$rowCls><td>$($_.EXPECTED_NAME)</td><td>$($_.TABLE_NAME)</td><td>$($_.STATUS)</td></tr>"
     }) -join ''
     $idxPopupHtml = "<table class='idx-table'><thead><tr><th>Expected Index</th><th>Table</th><th>Status</th></tr></thead><tbody>$idxRows</tbody></table>"
 
@@ -469,6 +494,33 @@ function Build-Html {
                 $barColour = 'var(--amber)'
             }
         }
+        # Plan monitor table
+        $planMonHtml = ''
+        if ($planMonitor.Count -gt 0) {
+            $pmRows = $planMonitor | ForEach-Object {
+                $ratio = [double]$_.ratio
+                $ratioCls = if ($ratio -gt 10) { "color:var(--red);font-weight:700" } elseif ($ratio -gt 2) { "color:var(--amber)" } else { '' }
+                $op2 = HtmlEncode("$($_.operation) $($_.options)".Trim())
+                $obj = if ($_.object_name) { "<span class='muted' style='font-size:10px'>$(HtmlEncode($_.object_name))</span>" } else { '' }
+                "<tr>
+                  <td class='mono muted' style='font-size:10px'>$($_.line_id)</td>
+                  <td>$op2 $obj</td>
+                  <td class='muted'>$("{0:N0}" -f [int64]$_.estimated_rows)</td>
+                  <td>$("{0:N0}" -f [int64]$_.output_rows)</td>
+                  <td style='$ratioCls'>$ratio</td>
+                  <td class='muted'>$($_.read_gb) GB</td>
+                </tr>"
+            }
+            $planMonHtml = @"
+<div style="margin-top:12px">
+  <div class="lrq-title" style="margin-bottom:4px">Plan Monitor (executing operations)</div>
+  <table class="data-table" style="font-size:11px">
+    <thead><tr><th>#</th><th>Operation</th><th>Est Rows</th><th>Actual Rows</th><th>Ratio</th><th>Read</th></tr></thead>
+    <tbody>$($pmRows -join '')</tbody>
+  </table>
+</div>
+"@
+        }
         $lrqHtml = @"
 <div class="lrq-panel">
   <div class="lrq-title">Active Query (LRQ)</div>
@@ -484,9 +536,11 @@ function Build-Html {
     <tr><th>Elapsed</th><td>$elStr</td></tr>
     <tr><th>Remaining</th><td>$remStr</td></tr>
     <tr><th>ETA</th><td>$($op.estimated_finish)</td></tr>
+    <tr><th>Message</th><td class="muted" style="font-size:11px">$(HtmlEncode($op.message))</td></tr>
     <tr><th>SQL ID</th><td class="mono muted" style="font-size:11px">$($op.sql_id)</td></tr>
   </table>
   $slowWarning
+  $planMonHtml
   $(if ($op.sql_id) {
     "<button class='exec-plan-btn' onclick='copyExecPlan(`"$($op.sql_id)`",this)'>Copy Execution Plan</button>"
   })
@@ -898,39 +952,57 @@ function Get-LogTail {
 $credFile = Join-Path $env:APPDATA "ETLpulse\oracle.$selectedEnv.cred"
 if (-not (Test-Path (Split-Path $credFile))) { New-Item -ItemType Directory -Path (Split-Path $credFile) | Out-Null }
 
-if (Test-Path $credFile) {
-    try {
-        $script:OracleCred = Import-Clixml $credFile
-        Write-Host "Loaded saved credentials for: $($script:OracleCred.UserName)"
-    } catch {
-        Write-Warning "Saved credentials could not be decrypted (wrong user/machine). Re-entering credentials."
-        Remove-Item $credFile -Force
-        $script:OracleCred = $null
+$maxAttempts = 3
+$attempt = 0
+$connected = $false
+while (-not $connected) {
+    $attempt++
+    if ($attempt -gt $maxAttempts) {
+        Write-Error "Failed to connect after $maxAttempts attempts. Exiting."
+        exit 1
     }
-}
-if (-not $script:OracleCred) {
-    $script:OracleCred = Get-Credential -Message "Enter Oracle credentials for $selectedEnv ($($Config.OracleDSN))"
-    if (-not $script:OracleCred) { Write-Error "No credentials provided."; exit 1 }
-    $script:OracleCred | Export-Clixml $credFile
-    Write-Host "Credentials saved (encrypted) to $credFile"
-    Write-Host "NOTE: only this Windows account on this machine can decrypt them."
-}
 
-Write-Host "Testing Oracle connection..."
-$testPass   = $script:OracleCred.GetNetworkCredential().Password
-$testSafe   = $testPass.Replace('"', '""')
-$testUser   = $script:OracleCred.UserName
-$testDSN    = $Config.OracleDSN
-$testScript = @"
+    if ((Test-Path $credFile) -and $attempt -eq 1) {
+        try {
+            $script:OracleCred = Import-Clixml $credFile
+            Write-Host "Loaded saved credentials for: $($script:OracleCred.UserName)"
+        } catch {
+            Write-Warning "Saved credentials could not be decrypted - re-entering."
+            [System.IO.File]::Delete($credFile)
+            $script:OracleCred = $null
+        }
+    }
+
+    if (-not $script:OracleCred) {
+        $script:OracleCred = Get-Credential -Message "Enter Oracle credentials for $selectedEnv ($($Config.OracleDSN)) - attempt $attempt of $maxAttempts"
+        if (-not $script:OracleCred) { Write-Error "No credentials provided."; exit 1 }
+    }
+
+    Write-Host "Testing Oracle connection..."
+    $testPass   = $script:OracleCred.GetNetworkCredential().Password
+    $testSafe   = $testPass.Replace('"', '""')
+    $testUser   = $script:OracleCred.UserName
+    $testDSN    = $Config.OracleDSN
+    $testScript = @"
 CONNECT $testUser/"$testSafe"@$testDSN
 SELECT 'connected' FROM dual;
 EXIT;
 "@
-$testResult = $testScript | & $Config.SqlPlusPath -S /NOLOG 2>&1
-Write-Host "sqlplus response: $($testResult -join ' | ')"
-if ($testResult -match 'ORA-|SP2-|TNS-') {
-    Write-Warning "Connection failed. To re-enter credentials, delete the saved file and restart:"
-    Write-Warning "  Remove-Item '$credFile'"
+    $testResult = $testScript | & $Config.SqlPlusPath -S /NOLOG 2>&1
+    Write-Host "sqlplus response: $($testResult -join ' | ')"
+
+    if ($testResult -match 'ORA-01017') {
+        Write-Warning "Invalid username or password - please try again."
+        [System.IO.File]::Delete($credFile)
+        $script:OracleCred = $null
+    } elseif ($testResult -match 'ORA-|SP2-|TNS-') {
+        Write-Error "Connection to $selectedEnv failed. Check OracleDSN in config.ps1 and network connectivity."
+        exit 1
+    } else {
+        $script:OracleCred | Export-Clixml $credFile
+        Write-Host "Credentials saved (encrypted) to $credFile"
+        $connected = $true
+    }
 }
 
 # ---------------------------------------------------------------------------
